@@ -76,6 +76,8 @@ pub struct RegistryInfo {
     /// (`env.ledger().network_id()`), so clients can confirm they are
     /// talking to the network they expect without a hardcoded config value.
     pub network_id: BytesN<32>,
+}
+
 /// On-chain mirror of the server's off-chain verification result. Settable
 /// only by an address holding the verifier role (see `add_verifier`).
 #[contracttype]
@@ -170,11 +172,6 @@ pub enum Error {
     TermsHashTooLong = 10,
     InvalidResourceId = 11,
     InvalidMetadataPointer = 12,
-    AlreadyOwner = 13,
-    NoPendingTransfer = 14,
-    ReservedId = 15,
-    PriceExceedsMax = 16,
-    EmptyMetadata = 17,
     EmptyMetadata = 13,
     AlreadyOwner = 14,
     NoPendingTransfer = 15,
@@ -445,10 +442,6 @@ impl VaultRegistry {
 
         env.storage().persistent().remove(&key);
 
-        env.events().publish((symbol_short!("transfer"), id), (previous_owner, pending_owner));
-
-        env.storage().persistent().remove(&key);
-
         env.events().publish(
             (symbol_short!("transfer"), id),
             (previous_owner, pending_owner),
@@ -642,10 +635,6 @@ impl VaultRegistry {
             resource_schema_version: RESOURCE_SCHEMA_VERSION,
             network_id: env.ledger().network_id(),
         }
-    /// Number of resources currently owned by `creator`. Reflects ownership
-    /// transfers (unlike `count`, which is monotonic).
-    pub fn creator_resource_count(env: Env, creator: Address) -> u32 {
-        Self::creator_count(&env, &creator)
     }
 
     /// Current contract admin.
@@ -814,9 +803,6 @@ impl VaultRegistry {
             .persistent()
             .get(&key)
             .ok_or(Error::NotFound)
-    }
-
-        env.storage().persistent().get(&key).ok_or(Error::NotFound)
     }
 }
 
