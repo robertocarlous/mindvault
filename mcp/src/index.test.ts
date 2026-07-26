@@ -55,10 +55,12 @@ import {
   useProfile,
   listProfiles,
   networkProfile,
+  capabilities,
   _setAgentWallet,
   _setAgentApiKey,
   _resetProfiles,
 } from "./index.js";
+import { TOOL_CAPABILITIES } from "./toolManifest.js";
 
 function mockResponse(data: unknown, ok = true, status = 200): Response {
   const body = JSON.stringify(data);
@@ -948,7 +950,6 @@ describe("wallet_info balance details", () => {
   });
 });
 
-
 // ── networkProfile (#412) ───────────────────────────────────────────────────
 
 describe("networkProfile", () => {
@@ -1010,5 +1011,30 @@ describe("networkProfile", () => {
 
     expect(parsed.x402Network).toBeTruthy();
     expect(typeof parsed.x402Network).toBe("string");
+  });
+});
+
+// ── capabilities (#423) ──────────────────────────────────────────────────────
+
+describe("capabilities", () => {
+  it("returns valid, indented JSON matching the tool capability manifest", () => {
+    const result = capabilities();
+    expect(() => JSON.parse(result)).not.toThrow();
+    expect(result).toContain("\n");
+
+    const parsed = JSON.parse(result);
+    expect(parsed.version).toBe(1);
+    expect(parsed.tools).toEqual(TOOL_CAPABILITIES);
+  });
+
+  it("includes itself in the manifest as a non-mutating, walletless tool", () => {
+    const parsed = JSON.parse(capabilities());
+    const self = parsed.tools.find((t: { name: string }) => t.name === "mindvault_capabilities");
+    expect(self).toMatchObject({
+      requiresWallet: false,
+      requiresApiKey: false,
+      mutating: false,
+      mainnetGated: false,
+    });
   });
 });

@@ -20,6 +20,7 @@ exports[`MCP tool metadata > all tools have required fields 1`] = `
   "mindvault_tx_status",
   "mindvault_reset",
   "mindvault_metrics",
+  "mindvault_capabilities",
 ]
 `;
 

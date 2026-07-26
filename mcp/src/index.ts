@@ -48,6 +48,7 @@ import {
 import { signMutatingHeaders } from "./requestSignature.js";
 import { exportState, restoreState } from "./stateBackup.js";
 import { safeErrorMessage, safeLog } from "./redaction.js";
+import { buildToolCapabilityManifest } from "./toolManifest.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -1264,6 +1265,16 @@ async function checkBindings(): Promise<string> {
 }
 
 /**
+ * Return the machine-readable tool capability manifest as JSON: for every tool,
+ * whether it requires a wallet or publisher API key, which network(s) it talks
+ * to, its x402 payment behavior, and whether it mutates state / spends funds
+ * (and is therefore mainnet-gated). Pure and deterministic — no I/O.
+ */
+export function capabilities(): string {
+  return JSON.stringify(buildToolCapabilityManifest(), null, 2);
+}
+
+/**
  * Return the current metrics snapshot as JSON. Only counts, durations, and tool
  * names are included — never arguments, wallets, or API keys. When metrics are
  * disabled, returns an actionable note instead of counters. Pass reset=true to
@@ -1636,6 +1647,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: [],
       },
     },
+    {
+      name: "mindvault_capabilities",
+      description:
+        "Return a machine-readable capability manifest for every MindVault MCP tool: whether it requires a wallet or publisher API key, which network(s) it talks to (MindVault API, Stellar Horizon, Soroban RPC, sponsored-account service), its x402 payment behavior, and whether it mutates state or spends funds (and is therefore gated on mainnet). Use this to plan a call sequence without inferring requirements from tool descriptions.",
+      inputSchema: { type: "object", properties: {}, required: [] },
+    },
   ],
 }));
 
@@ -1697,6 +1714,8 @@ async function dispatchTool(name: string, args: any): Promise<string> {
       return restoreStateTool(args.blob as string, args.passphrase as string);
     case "mindvault_metrics":
       return toolMetrics(args.reset === true);
+    case "mindvault_capabilities":
+      return capabilities();
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
