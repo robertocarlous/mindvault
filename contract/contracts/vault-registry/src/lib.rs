@@ -1,11 +1,12 @@
 #![no_std]
 //! MindVault on-chain vault registry.
 //!
-//! Records each vault resource on Stellar: its creator, price (in USDC
-//! stroops, 7 decimals), and a metadata pointer (e.g. an IPFS URI or content
-//! hash). Payment itself still flows through x402 + the USDC SAC off this
-//! contract — this registry is the transparent, on-chain source of truth for
-//! *what* exists, *who* owns it, and *what it costs*.
+//! Records each vault resource on Stellar: its creator, price (in stroops of
+//! whatever `currency` it's denominated in — "USDC" by default), and a
+//! metadata pointer (e.g. an IPFS URI or content hash). Payment itself still
+//! flows through x402 + the USDC SAC off this contract — this registry is the
+//! transparent, on-chain source of truth for *what* exists, *who* owns it,
+//! and *what it costs*.
 //!
 //! Only the recorded creator can mutate a resource (enforced via
 //! `require_auth`). Ownership can be transferred.
@@ -29,13 +30,20 @@ const MAX_TAGS: u32 = 8;
 /// Maximum price in USDC stroops (6 decimals). Represents 1 trillion USDC.
 pub const MAX_PRICE: i128 = 1_000_000_000_000_000_000;
 const MAX_TAG_LEN: u32 = 32;
+/// Max length for a currency/asset code — matches Stellar's longest
+/// alphanumeric asset code format (`AssetCode12`).
+pub const MAX_CURRENCY_LEN: u32 = 12;
+/// Currency `register` stores when the caller doesn't specify one via
+/// `register_with_currency`. The existing marketplace is USDC-denominated, so
+/// this keeps `register`'s behavior unchanged for every current caller.
+pub const DEFAULT_CURRENCY: &str = "USDC";
 
 /// Stable registry name returned by [`VaultRegistry::registry_info`].
 pub const REGISTRY_NAME: &str = "mindvault-vault-registry";
 /// Version of the on-chain `Resource` schema. Bump whenever a change to the
 /// `Resource` struct's fields would require callers to change how they decode
-/// it (e.g. the tags field added in schema version 2).
-pub const RESOURCE_SCHEMA_VERSION: u32 = 2;
+/// it (e.g. the tags field added in schema version 2, currency in version 3).
+pub const RESOURCE_SCHEMA_VERSION: u32 = 3;
 
 /// Canonical list of every event topic this contract emits, paired with a
 /// human-readable description of its payload shape. This is the single
@@ -47,9 +55,18 @@ pub const RESOURCE_SCHEMA_VERSION: u32 = 2;
 /// code, this const, and the docs fails a test.
 pub const EVENT_SCHEMA: &[(&str, &str)] = &[
     ("register", "Resource"),
-    ("setprice", "PriceUpdated { id, old_price, new_price, updater }"),
-    ("updmeta", "MetadataUpdateEvent { id, old_metadata, new_metadata }"),
-    ("settags", "(prev_tags: Vec<String>, next_tags: Vec<String>)"),
+    (
+        "setprice",
+        "PriceUpdated { id, old_price, new_price, updater }",
+    ),
+    (
+        "updmeta",
+        "MetadataUpdateEvent { id, old_metadata, new_metadata }",
+    ),
+    (
+        "settags",
+        "(prev_tags: Vec<String>, next_tags: Vec<String>)",
+    ),
     ("transfer", "(previous_owner: Address, new_owner: Address)"),
     ("propose", "(owner: Address, proposed: Address)"),
     ("cancel", "owner: Address"),
@@ -94,6 +111,12 @@ pub struct Resource {
     pub id: String,
     pub creator: Address,
     pub price: i128,
+    /// Currency/asset code `price` is denominated in (e.g. "USDC", "EURC") —
+    /// 1–12 uppercase ASCII letters/digits, the same charset Stellar asset
+    /// codes use. Set at registration; currently immutable. Defaults to
+    /// `DEFAULT_CURRENCY` ("USDC") via `register`, or an explicit code via
+    /// `register_with_currency`.
+    pub currency: String,
     pub metadata: String,
     pub listed: bool,
     /// Discovery labels (e.g. "dataset", "research"). Distinct from `metadata`,
@@ -183,6 +206,7 @@ pub enum Error {
     AlreadyFrozen = 21,
     MetadataFrozen = 22,
     DuplicateInRepair = 23,
+    InvalidCurrency = 24,
 }
 
 #[contract]
@@ -190,9 +214,11 @@ pub struct VaultRegistry;
 
 #[contractimpl]
 impl VaultRegistry {
-    /// Register a new resource. Price is in USDC stroops (6 decimals).
-    /// Rejects `price <= 0` (`InvalidPrice`) or `price > MAX_PRICE` (`PriceExceedsMax`).
-    /// Requires the creator's authorization.
+    /// Register a new resource, priced in `DEFAULT_CURRENCY` ("USDC"). Price
+    /// is in USDC stroops (6 decimals). Rejects `price <= 0` (`InvalidPrice`)
+    /// or `price > MAX_PRICE` (`PriceExceedsMax`). Requires the creator's
+    /// authorization. Use `register_with_currency` for a resource priced in
+    /// a different currency/asset code.
     pub fn register(
         env: Env,
         creator: Address,
@@ -201,52 +227,27 @@ impl VaultRegistry {
         metadata: String,
         tags: Vec<String>,
     ) -> Result<(), Error> {
-        creator.require_auth();
-        Self::validate_price(price)?;
-        Self::validate_resource_id(&id)?;
-        Self::validate_metadata_pointer(&metadata)?;
-        Self::validate_tags(&env, &tags)?;
-        if Self::is_reserved_id(&id) {
-            return Err(Error::ReservedId);
-        }
-        let key = DataKey::Resource(id.clone());
-        if env.storage().persistent().has(&key) {
-            return Err(Error::AlreadyRegistered);
-        }
+        let currency = String::from_str(&env, DEFAULT_CURRENCY);
+        Self::register_internal(env, creator, id, price, currency, metadata, tags)
+    }
 
-        let resource = Resource {
-            id: id.clone(),
-            creator: creator.clone(),
-            price,
-            metadata,
-            listed: true,
-            tags,
-            verified: VerificationStatus::Pending,
-            frozen: false,
-        };
-        env.storage().persistent().set(&key, &resource);
-        Self::bump_persistent(&env, &key);
-
-        let count: u32 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
-        let idx_key = DataKey::Index(count);
-        env.storage().persistent().set(&idx_key, &id);
-        Self::bump_persistent(&env, &idx_key);
-        env.storage().instance().set(&DataKey::Count, &(count + 1));
-        Self::bump_instance(&env);
-
-        let mut list = Self::creator_list(&env, &creator);
-        list.push_back(id.clone());
-        env.storage()
-            .persistent()
-            .set(&Self::creator_key(&env, &creator), &list);
-        Self::bump_persistent(&env, &Self::creator_key(&env, &creator));
-
-        let cur = Self::creator_count(&env, &creator);
-        Self::set_creator_count(&env, &creator, cur + 1);
-
-        env.events()
-            .publish((symbol_short!("register"), creator), resource);
-        Ok(())
+    /// Register a new resource priced in an explicit currency/asset code
+    /// (e.g. "USDC", "EURC") instead of the default. `currency` must be 1–12
+    /// uppercase ASCII letters/digits (`InvalidCurrency` otherwise) — the
+    /// same charset Stellar asset codes use. Otherwise behaves exactly like
+    /// `register` (same price/id/metadata/tag validation, same auth,
+    /// same `register` event).
+    pub fn register_with_currency(
+        env: Env,
+        creator: Address,
+        id: String,
+        price: i128,
+        currency: String,
+        metadata: String,
+        tags: Vec<String>,
+    ) -> Result<(), Error> {
+        Self::validate_currency(&currency)?;
+        Self::register_internal(env, creator, id, price, currency, metadata, tags)
     }
 
     /// Update a resource's price. Rejects `new_price <= 0` or `new_price > MAX_PRICE`.
@@ -799,10 +800,7 @@ impl VaultRegistry {
     /// Fetch a creator's marketplace terms hash. Errors with `NotFound` if it does not exist.
     pub fn get_terms_hash(env: Env, creator: Address) -> Result<String, Error> {
         let key = DataKey::CreatorTerms(creator);
-        env.storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::NotFound)
+        env.storage().persistent().get(&key).ok_or(Error::NotFound)
     }
 }
 
@@ -813,6 +811,23 @@ impl VaultRegistry {
         }
         if price > MAX_PRICE {
             return Err(Error::PriceExceedsMax);
+        }
+        Ok(())
+    }
+
+    /// A currency/asset code must be 1–12 uppercase ASCII letters/digits —
+    /// the same charset Stellar asset codes use (e.g. "USDC", "EURC", "BTC1").
+    fn validate_currency(currency: &String) -> Result<(), Error> {
+        let len = currency.len();
+        if len == 0 || len > MAX_CURRENCY_LEN {
+            return Err(Error::InvalidCurrency);
+        }
+        let mut buf = alloc::vec![0u8; len as usize];
+        currency.copy_into_slice(&mut buf);
+        for &b in buf.iter() {
+            if !(b.is_ascii_uppercase() || b.is_ascii_digit()) {
+                return Err(Error::InvalidCurrency);
+            }
         }
         Ok(())
     }
@@ -900,6 +915,67 @@ impl VaultRegistry {
                 return Err(Error::InvalidTag);
             }
         }
+        Ok(())
+    }
+
+    /// Shared body of `register`/`register_with_currency`. Assumes `currency`
+    /// has already been validated (or is the trusted `DEFAULT_CURRENCY`
+    /// literal) by the caller.
+    fn register_internal(
+        env: Env,
+        creator: Address,
+        id: String,
+        price: i128,
+        currency: String,
+        metadata: String,
+        tags: Vec<String>,
+    ) -> Result<(), Error> {
+        creator.require_auth();
+        Self::validate_price(price)?;
+        Self::validate_resource_id(&id)?;
+        Self::validate_metadata_pointer(&metadata)?;
+        Self::validate_tags(&env, &tags)?;
+        if Self::is_reserved_id(&id) {
+            return Err(Error::ReservedId);
+        }
+        let key = DataKey::Resource(id.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyRegistered);
+        }
+
+        let resource = Resource {
+            id: id.clone(),
+            creator: creator.clone(),
+            price,
+            currency,
+            metadata,
+            listed: true,
+            tags,
+            verified: VerificationStatus::Pending,
+            frozen: false,
+        };
+        env.storage().persistent().set(&key, &resource);
+        Self::bump_persistent(&env, &key);
+
+        let count: u32 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
+        let idx_key = DataKey::Index(count);
+        env.storage().persistent().set(&idx_key, &id);
+        Self::bump_persistent(&env, &idx_key);
+        env.storage().instance().set(&DataKey::Count, &(count + 1));
+        Self::bump_instance(&env);
+
+        let mut list = Self::creator_list(&env, &creator);
+        list.push_back(id.clone());
+        env.storage()
+            .persistent()
+            .set(&Self::creator_key(&env, &creator), &list);
+        Self::bump_persistent(&env, &Self::creator_key(&env, &creator));
+
+        let cur = Self::creator_count(&env, &creator);
+        Self::set_creator_count(&env, &creator, cur + 1);
+
+        env.events()
+            .publish((symbol_short!("register"), creator), resource);
         Ok(())
     }
 

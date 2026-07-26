@@ -196,6 +196,151 @@ fn maximum_price_accepted() {
     assert_eq!(client.get(&id).price, MAX_PRICE);
 }
 
+// ─── Currency code (#426) ──────────────────────────────────────────────────
+
+#[test]
+fn register_defaults_currency_to_usdc() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "curdefault");
+    let metadata = String::from_str(&env, "ipfs://x");
+    client.register(&creator, &id, &100i128, &metadata, &empty_tags(&env));
+    assert_eq!(client.get(&id).currency, String::from_str(&env, "USDC"));
+}
+
+#[test]
+fn register_with_currency_accepts_valid_code() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "cureurc");
+    let metadata = String::from_str(&env, "ipfs://x");
+    let currency = String::from_str(&env, "EURC");
+    client.register_with_currency(
+        &creator,
+        &id,
+        &100i128,
+        &currency,
+        &metadata,
+        &empty_tags(&env),
+    );
+    assert_eq!(client.get(&id).currency, currency);
+    // Price/metadata/listing behave exactly like `register`.
+    assert_eq!(client.get(&id).price, 100i128);
+    assert!(client.get(&id).listed);
+}
+
+#[test]
+fn register_with_currency_max_length_accepted() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "curmaxlen");
+    let metadata = String::from_str(&env, "ipfs://x");
+    let currency = String::from_str(&env, "ABCDEFGHIJKL"); // 12 chars, at MAX_CURRENCY_LEN
+    client.register_with_currency(
+        &creator,
+        &id,
+        &100i128,
+        &currency,
+        &metadata,
+        &empty_tags(&env),
+    );
+    assert_eq!(client.get(&id).currency, currency);
+}
+
+#[test]
+fn register_with_currency_rejects_empty() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "curempty");
+    let metadata = String::from_str(&env, "ipfs://x");
+    let currency = String::from_str(&env, "");
+    assert_eq!(
+        client.try_register_with_currency(
+            &creator,
+            &id,
+            &100i128,
+            &currency,
+            &metadata,
+            &empty_tags(&env)
+        ),
+        Err(Ok(Error::InvalidCurrency))
+    );
+    assert!(!client.exists(&id));
+}
+
+#[test]
+fn register_with_currency_rejects_over_max_length() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "curtoolong");
+    let metadata = String::from_str(&env, "ipfs://x");
+    let currency = String::from_str(&env, "ABCDEFGHIJKLM"); // 13 chars, over MAX_CURRENCY_LEN
+    assert_eq!(
+        client.try_register_with_currency(
+            &creator,
+            &id,
+            &100i128,
+            &currency,
+            &metadata,
+            &empty_tags(&env)
+        ),
+        Err(Ok(Error::InvalidCurrency))
+    );
+}
+
+#[test]
+fn register_with_currency_rejects_lowercase() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "curlower");
+    let metadata = String::from_str(&env, "ipfs://x");
+    let currency = String::from_str(&env, "usdc");
+    assert_eq!(
+        client.try_register_with_currency(
+            &creator,
+            &id,
+            &100i128,
+            &currency,
+            &metadata,
+            &empty_tags(&env)
+        ),
+        Err(Ok(Error::InvalidCurrency))
+    );
+}
+
+#[test]
+fn register_with_currency_rejects_non_alphanumeric() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "curbadchar");
+    let metadata = String::from_str(&env, "ipfs://x");
+    for bad in ["USD-C", "USD C", "USD.C", "USD_C"] {
+        let currency = String::from_str(&env, bad);
+        assert_eq!(
+            client.try_register_with_currency(
+                &creator,
+                &id,
+                &100i128,
+                &currency,
+                &metadata,
+                &empty_tags(&env)
+            ),
+            Err(Ok(Error::InvalidCurrency))
+        );
+    }
+}
+
+#[test]
+fn register_with_currency_invalid_currency_does_not_register() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "curnoop");
+    let metadata = String::from_str(&env, "ipfs://x");
+    let currency = String::from_str(&env, "bad");
+    let _ = client.try_register_with_currency(
+        &creator,
+        &id,
+        &100i128,
+        &currency,
+        &metadata,
+        &empty_tags(&env),
+    );
+    assert!(!client.exists(&id));
+    assert_eq!(client.count(), 0);
+}
+
 #[test]
 fn invalid_resource_id_rejected() {
     let (env, creator, client) = setup();
@@ -935,7 +1080,10 @@ fn update_metadata_rejects_over_max_length() {
         client.try_update_metadata(&id, &metadata),
         Err(Ok(Error::MetadataTooLong))
     );
-    assert_eq!(client.get(&id).metadata, String::from_str(&env, "ar://short"));
+    assert_eq!(
+        client.get(&id).metadata,
+        String::from_str(&env, "ar://short")
+    );
 }
 
 // Empty metadata and single-character metadata (e.g. "a") are both rejected
@@ -1566,11 +1714,18 @@ fn update_metadata_failed_validation_emits_no_event() {
         client.try_update_metadata(&id, &empty),
         Err(Ok(Error::EmptyMetadata))
     );
-    assert_eq!(client.get(&id).metadata, String::from_str(&env, "ipfs://valid"));
+    assert_eq!(
+        client.get(&id).metadata,
+        String::from_str(&env, "ipfs://valid")
+    );
 
     // No updmeta event should be emitted when the call fails.
     let events = collect_updmeta_events(&env, &client.address);
-    assert_eq!(events.len(), 0, "failed update_metadata must not emit any updmeta event");
+    assert_eq!(
+        events.len(),
+        0,
+        "failed update_metadata must not emit any updmeta event"
+    );
 }
 
 #[test]
@@ -1914,7 +2069,13 @@ fn creator_resource_count_increments_on_register() {
     // Failed duplicate does not inflate count.
     let dup = String::from_str(&env, "r1");
     assert_eq!(
-        client.try_register(&creator, &dup, &100i128, &String::from_str(&env, "ipfs://m"), &empty_tags(&env)),
+        client.try_register(
+            &creator,
+            &dup,
+            &100i128,
+            &String::from_str(&env, "ipfs://m"),
+            &empty_tags(&env)
+        ),
         Err(Ok(Error::AlreadyRegistered)),
     );
     assert_eq!(client.creator_resource_count(&creator), 2);
@@ -2025,7 +2186,7 @@ fn set_tags_event_includes_prev_and_next() {
     let (env, creator, client) = setup();
     let id = String::from_str(&env, "event-test");
     let metadata = String::from_str(&env, "ipfs://m");
-    
+
     let id = String::from_str(&env, "eventtest");
     let metadata = String::from_str(&env, "ipfs://m");
 
@@ -2072,7 +2233,7 @@ fn set_tags_event_supports_tag_removal() {
     let (env, creator, client) = setup();
     let id = String::from_str(&env, "removal-test");
     let metadata = String::from_str(&env, "ipfs://m");
-    
+
     let id = String::from_str(&env, "removaltest");
     let metadata = String::from_str(&env, "ipfs://m");
 
@@ -2103,7 +2264,7 @@ fn set_tags_event_supports_tag_addition() {
     let (env, creator, client) = setup();
     let id = String::from_str(&env, "addition-test");
     let metadata = String::from_str(&env, "ipfs://m");
-    
+
     let id = String::from_str(&env, "additiontest");
     let metadata = String::from_str(&env, "ipfs://m");
 
@@ -2134,7 +2295,7 @@ fn set_tags_event_on_replacement() {
     let (env, creator, client) = setup();
     let id = String::from_str(&env, "replace-test");
     let metadata = String::from_str(&env, "ipfs://m");
-    
+
     let id = String::from_str(&env, "replacetest");
     let metadata = String::from_str(&env, "ipfs://m");
 
@@ -2236,7 +2397,10 @@ fn registry_info_is_stable_across_calls_and_registrations() {
     );
 
     let after = client.registry_info();
-    assert_eq!(before, after, "registry_info must not depend on registry contents");
+    assert_eq!(
+        before, after,
+        "registry_info must not depend on registry contents"
+    );
 }
 
 // ---------------------------------------------------------------------------
