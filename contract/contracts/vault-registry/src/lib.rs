@@ -1,11 +1,12 @@
 #![no_std]
 //! MindVault on-chain vault registry.
 //!
-//! Records each vault resource on Stellar: its creator, price (in USDC
-//! stroops, 7 decimals), and a metadata pointer (e.g. an IPFS URI or content
-//! hash). Payment itself still flows through x402 + the USDC SAC off this
-//! contract — this registry is the transparent, on-chain source of truth for
-//! *what* exists, *who* owns it, and *what it costs*.
+//! Records each vault resource on Stellar: its creator, price (in stroops,
+//! 7 decimals), the payment asset contract the price is denominated in
+//! (e.g. a network's USDC SAC), and a metadata pointer (e.g. an IPFS URI or
+//! content hash). Payment itself still flows through x402 + the USDC SAC off
+//! this contract — this registry is the transparent, on-chain source of
+//! truth for *what* exists, *who* owns it, and *what it costs*.
 //!
 //! Only the recorded creator can mutate a resource (enforced via
 //! `require_auth`). Ownership can be transferred.
@@ -29,13 +30,26 @@ const MAX_TAGS: u32 = 8;
 /// Maximum price in USDC stroops (6 decimals). Represents 1 trillion USDC.
 pub const MAX_PRICE: i128 = 1_000_000_000_000_000_000;
 const MAX_TAG_LEN: u32 = 32;
+/// Length of a Stellar contract ID in strkey form (`C...`), e.g. a Soroban
+/// Asset Contract (SAC) address. Always exactly 56 characters.
+pub const ASSET_CONTRACT_ID_LEN: u32 = 56;
+/// Asset contract `register` stores when the caller doesn't specify one via
+/// `register_with_asset`: the canonical **testnet** USDC SAC (matches
+/// `packages/registry-client/src/networks.ts`'s testnet preset). This is a
+/// compile-time default, not a network-aware one — a contract instance
+/// cannot know which network it's deployed on. Deployments to any other
+/// network (mainnet, futurenet, ...) must always call `register_with_asset`
+/// with that network's real SAC address; never rely on this default there.
+pub const DEFAULT_ASSET_CONTRACT_ID: &str =
+    "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
 
 /// Stable registry name returned by [`VaultRegistry::registry_info`].
 pub const REGISTRY_NAME: &str = "mindvault-vault-registry";
 /// Version of the on-chain `Resource` schema. Bump whenever a change to the
 /// `Resource` struct's fields would require callers to change how they decode
-/// it (e.g. the tags field added in schema version 2).
-pub const RESOURCE_SCHEMA_VERSION: u32 = 2;
+/// it (e.g. the tags field added in schema version 2, asset_contract in
+/// version 3).
+pub const RESOURCE_SCHEMA_VERSION: u32 = 3;
 
 /// Canonical list of every event topic this contract emits, paired with a
 /// human-readable description of its payload shape. This is the single
@@ -47,9 +61,18 @@ pub const RESOURCE_SCHEMA_VERSION: u32 = 2;
 /// code, this const, and the docs fails a test.
 pub const EVENT_SCHEMA: &[(&str, &str)] = &[
     ("register", "Resource"),
-    ("setprice", "PriceUpdated { id, old_price, new_price, updater }"),
-    ("updmeta", "MetadataUpdateEvent { id, old_metadata, new_metadata }"),
-    ("settags", "(prev_tags: Vec<String>, next_tags: Vec<String>)"),
+    (
+        "setprice",
+        "PriceUpdated { id, old_price, new_price, updater }",
+    ),
+    (
+        "updmeta",
+        "MetadataUpdateEvent { id, old_metadata, new_metadata }",
+    ),
+    (
+        "settags",
+        "(prev_tags: Vec<String>, next_tags: Vec<String>)",
+    ),
     ("transfer", "(previous_owner: Address, new_owner: Address)"),
     ("propose", "(owner: Address, proposed: Address)"),
     ("cancel", "owner: Address"),
@@ -94,6 +117,14 @@ pub struct Resource {
     pub id: String,
     pub creator: Address,
     pub price: i128,
+    /// Stellar contract ID (strkey, `C...`) of the payment asset — typically
+    /// a Soroban Asset Contract (SAC) such as USDC's. Distinct networks have
+    /// distinct SAC addresses for "the same" asset, so indexers use this
+    /// (not a currency label) to identify exactly which deployment a price is
+    /// denominated in. Set at registration; currently immutable. Defaults to
+    /// `DEFAULT_ASSET_CONTRACT_ID` via `register`, or an explicit address via
+    /// `register_with_asset`.
+    pub asset_contract: String,
     pub metadata: String,
     pub listed: bool,
     /// Discovery labels (e.g. "dataset", "research"). Distinct from `metadata`,
@@ -183,6 +214,7 @@ pub enum Error {
     AlreadyFrozen = 21,
     MetadataFrozen = 22,
     DuplicateInRepair = 23,
+    InvalidAssetContract = 24,
 }
 
 #[contract]
@@ -201,52 +233,30 @@ impl VaultRegistry {
         metadata: String,
         tags: Vec<String>,
     ) -> Result<(), Error> {
-        creator.require_auth();
-        Self::validate_price(price)?;
-        Self::validate_resource_id(&id)?;
-        Self::validate_metadata_pointer(&metadata)?;
-        Self::validate_tags(&env, &tags)?;
-        if Self::is_reserved_id(&id) {
-            return Err(Error::ReservedId);
-        }
-        let key = DataKey::Resource(id.clone());
-        if env.storage().persistent().has(&key) {
-            return Err(Error::AlreadyRegistered);
-        }
+        let asset_contract = String::from_str(&env, DEFAULT_ASSET_CONTRACT_ID);
+        Self::register_internal(env, creator, id, price, asset_contract, metadata, tags)
+    }
 
-        let resource = Resource {
-            id: id.clone(),
-            creator: creator.clone(),
-            price,
-            metadata,
-            listed: true,
-            tags,
-            verified: VerificationStatus::Pending,
-            frozen: false,
-        };
-        env.storage().persistent().set(&key, &resource);
-        Self::bump_persistent(&env, &key);
-
-        let count: u32 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
-        let idx_key = DataKey::Index(count);
-        env.storage().persistent().set(&idx_key, &id);
-        Self::bump_persistent(&env, &idx_key);
-        env.storage().instance().set(&DataKey::Count, &(count + 1));
-        Self::bump_instance(&env);
-
-        let mut list = Self::creator_list(&env, &creator);
-        list.push_back(id.clone());
-        env.storage()
-            .persistent()
-            .set(&Self::creator_key(&env, &creator), &list);
-        Self::bump_persistent(&env, &Self::creator_key(&env, &creator));
-
-        let cur = Self::creator_count(&env, &creator);
-        Self::set_creator_count(&env, &creator, cur + 1);
-
-        env.events()
-            .publish((symbol_short!("register"), creator), resource);
-        Ok(())
+    /// Register a new resource priced against an explicit payment asset
+    /// contract (a Stellar contract ID in strkey form, e.g. a Soroban Asset
+    /// Contract address) instead of the default. Rejects a malformed
+    /// `asset_contract` with `InvalidAssetContract`: it must be exactly
+    /// `ASSET_CONTRACT_ID_LEN` (56) characters, start with `C`, and use only
+    /// the base32 strkey charset (`A`-`Z`, `2`-`7`). This checks shape only,
+    /// not the strkey checksum or that a contract actually exists at that
+    /// address. Otherwise behaves exactly like `register` (same price/id/
+    /// metadata/tag validation, same auth, same `register` event).
+    pub fn register_with_asset(
+        env: Env,
+        creator: Address,
+        id: String,
+        price: i128,
+        asset_contract: String,
+        metadata: String,
+        tags: Vec<String>,
+    ) -> Result<(), Error> {
+        Self::validate_asset_contract(&asset_contract)?;
+        Self::register_internal(env, creator, id, price, asset_contract, metadata, tags)
     }
 
     /// Update a resource's price. Rejects `new_price <= 0` or `new_price > MAX_PRICE`.
@@ -799,10 +809,7 @@ impl VaultRegistry {
     /// Fetch a creator's marketplace terms hash. Errors with `NotFound` if it does not exist.
     pub fn get_terms_hash(env: Env, creator: Address) -> Result<String, Error> {
         let key = DataKey::CreatorTerms(creator);
-        env.storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::NotFound)
+        env.storage().persistent().get(&key).ok_or(Error::NotFound)
     }
 }
 
@@ -813,6 +820,29 @@ impl VaultRegistry {
         }
         if price > MAX_PRICE {
             return Err(Error::PriceExceedsMax);
+        }
+        Ok(())
+    }
+
+    /// Shape-only validation of a Stellar contract ID in strkey form: exactly
+    /// `ASSET_CONTRACT_ID_LEN` (56) bytes, starting with `C`, using only the
+    /// base32 strkey charset (`A`-`Z`, `2`-`7`). Does not verify the strkey
+    /// checksum or that a contract exists at that address.
+    fn validate_asset_contract(asset_contract: &String) -> Result<(), Error> {
+        let len = asset_contract.len();
+        if len != ASSET_CONTRACT_ID_LEN {
+            return Err(Error::InvalidAssetContract);
+        }
+        let mut buf = alloc::vec![0u8; len as usize];
+        asset_contract.copy_into_slice(&mut buf);
+        if buf[0] != b'C' {
+            return Err(Error::InvalidAssetContract);
+        }
+        for &b in buf.iter() {
+            let is_base32 = b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b);
+            if !is_base32 {
+                return Err(Error::InvalidAssetContract);
+            }
         }
         Ok(())
     }
@@ -900,6 +930,67 @@ impl VaultRegistry {
                 return Err(Error::InvalidTag);
             }
         }
+        Ok(())
+    }
+
+    /// Shared body of `register`/`register_with_asset`. Assumes
+    /// `asset_contract` has already been validated (or is the trusted
+    /// `DEFAULT_ASSET_CONTRACT_ID` literal) by the caller.
+    fn register_internal(
+        env: Env,
+        creator: Address,
+        id: String,
+        price: i128,
+        asset_contract: String,
+        metadata: String,
+        tags: Vec<String>,
+    ) -> Result<(), Error> {
+        creator.require_auth();
+        Self::validate_price(price)?;
+        Self::validate_resource_id(&id)?;
+        Self::validate_metadata_pointer(&metadata)?;
+        Self::validate_tags(&env, &tags)?;
+        if Self::is_reserved_id(&id) {
+            return Err(Error::ReservedId);
+        }
+        let key = DataKey::Resource(id.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyRegistered);
+        }
+
+        let resource = Resource {
+            id: id.clone(),
+            creator: creator.clone(),
+            price,
+            asset_contract,
+            metadata,
+            listed: true,
+            tags,
+            verified: VerificationStatus::Pending,
+            frozen: false,
+        };
+        env.storage().persistent().set(&key, &resource);
+        Self::bump_persistent(&env, &key);
+
+        let count: u32 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
+        let idx_key = DataKey::Index(count);
+        env.storage().persistent().set(&idx_key, &id);
+        Self::bump_persistent(&env, &idx_key);
+        env.storage().instance().set(&DataKey::Count, &(count + 1));
+        Self::bump_instance(&env);
+
+        let mut list = Self::creator_list(&env, &creator);
+        list.push_back(id.clone());
+        env.storage()
+            .persistent()
+            .set(&Self::creator_key(&env, &creator), &list);
+        Self::bump_persistent(&env, &Self::creator_key(&env, &creator));
+
+        let cur = Self::creator_count(&env, &creator);
+        Self::set_creator_count(&env, &creator, cur + 1);
+
+        env.events()
+            .publish((symbol_short!("register"), creator), resource);
         Ok(())
     }
 

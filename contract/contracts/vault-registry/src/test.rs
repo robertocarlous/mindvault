@@ -196,6 +196,178 @@ fn maximum_price_accepted() {
     assert_eq!(client.get(&id).price, MAX_PRICE);
 }
 
+// ─── Asset contract ID (#427) ───────────────────────────────────────────────
+
+/// A real, well-known mainnet USDC SAC address — used as a "custom" asset in
+/// tests to make sure it's distinct from `DEFAULT_ASSET_CONTRACT_ID` (testnet).
+const OTHER_VALID_ASSET_CONTRACT: &str = "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75";
+
+#[test]
+fn register_defaults_asset_contract() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "assetdefault");
+    let metadata = String::from_str(&env, "ipfs://x");
+    client.register(&creator, &id, &100i128, &metadata, &empty_tags(&env));
+    assert_eq!(
+        client.get(&id).asset_contract,
+        String::from_str(&env, DEFAULT_ASSET_CONTRACT_ID)
+    );
+}
+
+#[test]
+fn register_with_asset_accepts_valid_contract_id() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "assetcustom");
+    let metadata = String::from_str(&env, "ipfs://x");
+    let asset_contract = String::from_str(&env, OTHER_VALID_ASSET_CONTRACT);
+    client.register_with_asset(
+        &creator,
+        &id,
+        &100i128,
+        &asset_contract,
+        &metadata,
+        &empty_tags(&env),
+    );
+    assert_eq!(client.get(&id).asset_contract, asset_contract);
+    // Price/metadata/listing behave exactly like `register`.
+    assert_eq!(client.get(&id).price, 100i128);
+    assert!(client.get(&id).listed);
+}
+
+/// `get`/`list` return the same `asset_contract` a resource was registered with.
+#[test]
+fn get_and_list_return_asset_contract() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "assetlist");
+    let metadata = String::from_str(&env, "ipfs://x");
+    let asset_contract = String::from_str(&env, OTHER_VALID_ASSET_CONTRACT);
+    client.register_with_asset(
+        &creator,
+        &id,
+        &100i128,
+        &asset_contract,
+        &metadata,
+        &empty_tags(&env),
+    );
+
+    assert_eq!(client.get(&id).asset_contract, asset_contract);
+    let page = client.list(&0u32, &10u32);
+    assert_eq!(page.get(0).unwrap().asset_contract, asset_contract);
+}
+
+#[test]
+fn register_with_asset_rejects_wrong_length() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "assetshort");
+    let metadata = String::from_str(&env, "ipfs://x");
+    // 55 chars — one short of ASSET_CONTRACT_ID_LEN.
+    let too_short = String::from_str(
+        &env,
+        "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAM",
+    );
+    assert_eq!(
+        client.try_register_with_asset(
+            &creator,
+            &id,
+            &100i128,
+            &too_short,
+            &metadata,
+            &empty_tags(&env)
+        ),
+        Err(Ok(Error::InvalidAssetContract))
+    );
+    // 57 chars — one over.
+    let too_long = String::from_str(
+        &env,
+        "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMAA",
+    );
+    assert_eq!(
+        client.try_register_with_asset(
+            &creator,
+            &id,
+            &100i128,
+            &too_long,
+            &metadata,
+            &empty_tags(&env)
+        ),
+        Err(Ok(Error::InvalidAssetContract))
+    );
+    assert!(!client.exists(&id));
+}
+
+#[test]
+fn register_with_asset_rejects_missing_c_prefix() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "assetprefix");
+    let metadata = String::from_str(&env, "ipfs://x");
+    // Same length as a real contract ID, but starts with 'G' (an account id prefix).
+    let wrong_prefix = String::from_str(
+        &env,
+        "GBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+    );
+    assert_eq!(
+        client.try_register_with_asset(
+            &creator,
+            &id,
+            &100i128,
+            &wrong_prefix,
+            &metadata,
+            &empty_tags(&env)
+        ),
+        Err(Ok(Error::InvalidAssetContract))
+    );
+}
+
+#[test]
+fn register_with_asset_rejects_lowercase() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "assetlower");
+    let metadata = String::from_str(&env, "ipfs://x");
+    let lowercase = String::from_str(
+        &env,
+        "cbieltk6ybzju5up2wwqeucyklpu6aunz2bq4wwfeie3uscihmxqdama",
+    );
+    assert_eq!(
+        client.try_register_with_asset(
+            &creator,
+            &id,
+            &100i128,
+            &lowercase,
+            &metadata,
+            &empty_tags(&env)
+        ),
+        Err(Ok(Error::InvalidAssetContract))
+    );
+}
+
+#[test]
+fn register_with_asset_rejects_non_base32_chars() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "assetbadchar");
+    let metadata = String::from_str(&env, "ipfs://x");
+    // '0', '1', '8', '9' are not in the base32 strkey charset (A-Z, 2-7).
+    let bad = String::from_str(
+        &env,
+        "C0IELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+    );
+    assert_eq!(
+        client.try_register_with_asset(&creator, &id, &100i128, &bad, &metadata, &empty_tags(&env)),
+        Err(Ok(Error::InvalidAssetContract))
+    );
+}
+
+#[test]
+fn register_with_asset_invalid_does_not_register() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "assetnoop");
+    let metadata = String::from_str(&env, "ipfs://x");
+    let bad = String::from_str(&env, "not-a-contract-id");
+    let _ =
+        client.try_register_with_asset(&creator, &id, &100i128, &bad, &metadata, &empty_tags(&env));
+    assert!(!client.exists(&id));
+    assert_eq!(client.count(), 0);
+}
+
 #[test]
 fn invalid_resource_id_rejected() {
     let (env, creator, client) = setup();
@@ -935,7 +1107,10 @@ fn update_metadata_rejects_over_max_length() {
         client.try_update_metadata(&id, &metadata),
         Err(Ok(Error::MetadataTooLong))
     );
-    assert_eq!(client.get(&id).metadata, String::from_str(&env, "ar://short"));
+    assert_eq!(
+        client.get(&id).metadata,
+        String::from_str(&env, "ar://short")
+    );
 }
 
 // Empty metadata and single-character metadata (e.g. "a") are both rejected
@@ -1566,11 +1741,18 @@ fn update_metadata_failed_validation_emits_no_event() {
         client.try_update_metadata(&id, &empty),
         Err(Ok(Error::EmptyMetadata))
     );
-    assert_eq!(client.get(&id).metadata, String::from_str(&env, "ipfs://valid"));
+    assert_eq!(
+        client.get(&id).metadata,
+        String::from_str(&env, "ipfs://valid")
+    );
 
     // No updmeta event should be emitted when the call fails.
     let events = collect_updmeta_events(&env, &client.address);
-    assert_eq!(events.len(), 0, "failed update_metadata must not emit any updmeta event");
+    assert_eq!(
+        events.len(),
+        0,
+        "failed update_metadata must not emit any updmeta event"
+    );
 }
 
 #[test]
@@ -1914,7 +2096,13 @@ fn creator_resource_count_increments_on_register() {
     // Failed duplicate does not inflate count.
     let dup = String::from_str(&env, "r1");
     assert_eq!(
-        client.try_register(&creator, &dup, &100i128, &String::from_str(&env, "ipfs://m"), &empty_tags(&env)),
+        client.try_register(
+            &creator,
+            &dup,
+            &100i128,
+            &String::from_str(&env, "ipfs://m"),
+            &empty_tags(&env)
+        ),
         Err(Ok(Error::AlreadyRegistered)),
     );
     assert_eq!(client.creator_resource_count(&creator), 2);
@@ -2025,7 +2213,7 @@ fn set_tags_event_includes_prev_and_next() {
     let (env, creator, client) = setup();
     let id = String::from_str(&env, "event-test");
     let metadata = String::from_str(&env, "ipfs://m");
-    
+
     let id = String::from_str(&env, "eventtest");
     let metadata = String::from_str(&env, "ipfs://m");
 
@@ -2072,7 +2260,7 @@ fn set_tags_event_supports_tag_removal() {
     let (env, creator, client) = setup();
     let id = String::from_str(&env, "removal-test");
     let metadata = String::from_str(&env, "ipfs://m");
-    
+
     let id = String::from_str(&env, "removaltest");
     let metadata = String::from_str(&env, "ipfs://m");
 
@@ -2103,7 +2291,7 @@ fn set_tags_event_supports_tag_addition() {
     let (env, creator, client) = setup();
     let id = String::from_str(&env, "addition-test");
     let metadata = String::from_str(&env, "ipfs://m");
-    
+
     let id = String::from_str(&env, "additiontest");
     let metadata = String::from_str(&env, "ipfs://m");
 
@@ -2134,7 +2322,7 @@ fn set_tags_event_on_replacement() {
     let (env, creator, client) = setup();
     let id = String::from_str(&env, "replace-test");
     let metadata = String::from_str(&env, "ipfs://m");
-    
+
     let id = String::from_str(&env, "replacetest");
     let metadata = String::from_str(&env, "ipfs://m");
 
@@ -2236,7 +2424,10 @@ fn registry_info_is_stable_across_calls_and_registrations() {
     );
 
     let after = client.registry_info();
-    assert_eq!(before, after, "registry_info must not depend on registry contents");
+    assert_eq!(
+        before, after,
+        "registry_info must not depend on registry contents"
+    );
 }
 
 // ---------------------------------------------------------------------------
